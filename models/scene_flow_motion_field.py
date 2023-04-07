@@ -15,7 +15,11 @@
 import torch
 from models.video_base import VideoBaseModel
 from third_party.hourglass import HourglassModel_Embed
-from third_party.MiDaS import MidasNet
+
+import sys
+sys.path.insert(0, './third_party/MiDaS')
+from midas.model_loader import load_model
+
 from visualize.html_visualizer import HTMLVisualizer as Visualizer
 import torch.nn.functional as F
 import inspect
@@ -82,16 +86,11 @@ class Model(VideoBaseModel):
         self.gt_names = []
         self.requires = list(set().union(self.input_names, self.gt_names))
         if self.opt.midas:
-            resize = None
-            if 'real_video' in self.opt.dataset:
-                resize = [224, 384]
-            if 'korean' in self.opt.dataset:
-                resize = [224, 384]
-            if 'mctest' in self.opt.dataset:
-                resize = [224, 384]
-            if 'cube' in self.opt.dataset:
-                resize = [224, 384]
-            self.net_depth = MidasNet(path=midas_pretrain_path, non_negative=True, normalize_input=True, resize=resize)
+            device = torch.device("cuda")
+            model_type = 'dpt_beit_large_512'
+            optimize = False
+            self.net_depth, self.transform, self.net_w, self.net_h = load_model(
+                device, './pretrained_depth_ckpt/dpt_beit_large_512.pt', model_type, optimize=optimize)
 
         else:
             self.net_depth = HourglassModel_Embed(noexp=False, use_embedding=opt.use_embedding)
@@ -226,12 +225,31 @@ class Model(VideoBaseModel):
         batch_log = {'size': self.opt.batch_size, 'loss': loss.item(), **loss_data}
         return batch_log
 
+    def _apply_depth_model(self, original_image_rgb):
+        
+        img_batch = original_image_rgb
+        img_batch = torch.nn.functional.interpolate(img_batch, size=(512, 896), mode='bicubic', align_corners=True)
+        mean = torch.tensor([0.5, 0.5, 0.5]).cuda()
+        std = torch.tensor( [0.5, 0.5, 0.5]).cuda()
+        img_batch = img_batch.permute(0, 2, 3, 1)
+        img_batch = (img_batch - mean) / std
+        img_batch = img_batch.permute(0, 3, 1, 2)
+        pred_d = self.net_depth(img_batch)
+        pred_d = torch.nn.functional.interpolate(
+                pred_d.unsqueeze(1),
+                size = (192, 384),  # (1080, 1920),
+                mode="bicubic",
+                align_corners=False,
+            )
+
+        return pred_d
+    
     def _predict_on_batch(self, is_train=True):
 
         if is_train:
             if self.opt.midas:
-                depth_1 = self.net_depth(self._input.img_1)
-                depth_2 = self.net_depth(self._input.img_2)
+                depth_1 = self._apply_depth_model(self._input.img_1)
+                depth_2 = self._apply_depth_model(self._input.img_2)
 
             else:
                 depth_1 = self.net_depth(self._input.img_1, self._input.frame_id_1.long())
@@ -264,7 +282,7 @@ class Model(VideoBaseModel):
             result['sf_by_dep_1_2'] = dflow['sf_by_depth']
         else:
             if self.opt.midas:
-                depth = self.net_depth(self._input.img)
+                depth = self._apply_depth_model(self._input.img)
             else:
                 depth = self.net_depth(self._input.img, self._input.frame_id_1.long())
 
